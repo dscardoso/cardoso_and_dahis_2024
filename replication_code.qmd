@@ -1,0 +1,437 @@
+---
+title: "Replication code for Cardoso & Dahis (2024)"
+author: "Diego S. Cardoso and Ricardo Dahis"
+date: "March 25, 2024"
+toc: true
+toc-depth: 3
+format:
+  html:
+    html-math-method: katex
+    code-tools: true
+    self-contained: true
+---
+
+This Quarto document contains the replication code for the illustrations in the paper titled "Calculating the economic value of non-marginal mortality risk reductions", forthcoming in the Economics Letters. DOI: [https://doi.org/10.1016/j.econlet.2024.111673](10.1016/j.econlet.2024.111673)
+
+Suggested citation: 
+
+> Cardoso, D., Dahis. R. Calculating the economic value of non-marginal mortality risk reductions. Economics Letters (2004), DOI 10.1016/j.econlet.2024.111673.
+
+
+This package does not include the mortality data maintained by the United Nations. These data is publicly available from [United Nations World Population Prospects 2022 website](https://population.un.org/wpp/Download/Standard/CSV/).
+
+The results displayed in the paper were obtained using this code running on R version 4.3.1. It has the following dependencies:
+
+-   `data.table` version 1.14.8: for data manipulation
+-   `xtable` version 1.8-4: for formatting exporting results tables
+-   `ggplot2` version 3.4.3: for generating graphs
+-   `latex2exp` version 0.9.6: for inserting mathematical symbols into graphs
+
+## 1. Setup
+
+```{r setup}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+# Data manipulation packages
+library(data.table)
+
+# Table exporting package
+library(xtable)
+
+# Plotting packages
+library(latex2exp)
+library(ggplot2)
+
+# Path to folder where data files are
+DATA_FOLDER <- "." # <---- REPLACE HERE
+
+# Path to folder where tables and graphs should be saved
+OUTPUT_FOLDER <- "." # <---- REPLACE HERE
+```
+
+### 1.1 Environment parameters
+
+```{r}
+SAVETAB <- T # If false, running the code will not export any tables
+SAVEFIG <- T # If false, running the code will not export any graphs
+```
+
+
+### 1.2 Model parameters
+
+-   VSL-to-income ratio: $\hat{v} = 160$
+-   Reference-age: $\hat{a} = 40$
+-   Discount rate: 3%
+-   Age groups considered: 20, 50, and 80
+
+```{r}
+V_HAT <- 160
+A_HAT <- 40
+BETA <- 1/(1+0.03)
+AGES <- c(20, 50, 80)
+```
+
+Define a base year for the illustration and a previous year for comparison of mortality changes over time
+
+```{r}
+BASE_YEAR <- 2015
+PRE_YEAR <- 1990
+```
+
+
+### 1.3 Data
+
+Load complete (annual) life tables from the [United Nations World Population Prospects 2022](https://population.un.org/wpp/Download/Standard/CSV/).
+
+```{r}
+life_table <- fread(file.path(DATA_FOLDER, "WPP2022_Life_Table_Complete_Medium_Both_1950-2021.csv"))
+```
+
+For this illustration, we are going to look at the US in the base year and compare with mortality rates in an earlier year to gauge the magnitude of differences.
+
+```{r}
+life_table <- life_table[Time %in% c(PRE_YEAR, BASE_YEAR) & ISO3_code == "USA"]
+```
+
+Rename columns and keep only the ones needed for this illustration
+
+```{r}
+life_table <- life_table[,.(
+  year = Time,
+  age = AgeGrpStart, # Age group a
+  s_a = Sx # Annual survival probability
+)]
+```
+
+
+## 2. Calculations
+
+### 2.1 Discounted life expectancy
+
+We assume the annual survival probability for ages above 100 is held constant. Then, for the final age group of 100, the discounted life expectancy is given by
+
+$$
+l_{100} = \sum^\infty_{t=0}\beta^t s_{100}^t = \frac{1}{1-\beta s_{100}}
+$$
+
+```{r}
+life_table[age == 100, l_a:=1/(1-BETA*s_a)]
+```
+
+Life expectancy for earlier ages can be easily calculated using the recursive relation:
+$$
+	l_{a} = s_a + \beta s_a\sum^\infty_{t=0}\beta^t S_{a+1, t}^t = s_a (1 + \beta l_{a+1})
+$$
+```{r}
+setorder(life_table, year, -age)
+
+# We cannot vectorize this because each age depends on a write-read-write cycle, so we need to iterate recursively
+for (a in seq(99, 0)) {
+  life_table[, l_a:=ifelse(age == a & age != 100, s_a * (1 + BETA * shift(l_a, 1)), l_a),
+             by=.(year)]
+}
+```
+
+
+Store $s_{\hat{a}}$ for the reference year 1990 and calculate $\hat{\gamma} \equiv \frac{\hat{v}}{l_{\hat{a}}}$.
+
+
+```{r}
+S_A_HAT <- life_table[year == BASE_YEAR & age == A_HAT, s_a]
+L_A_HAT <- life_table[year == BASE_YEAR & age == A_HAT, l_a]
+GAMMA_HAT <- V_HAT/L_A_HAT*S_A_HAT
+```
+
+To make sense of the magnitude, these are the differences across ages.
+
+```{r}
+life_table[age %in% AGES,
+           .(s_a, l_a),
+           by=.(age, year)]
+```
+
+To gauge the SMUs for the illustration, we compare survival probabilities between the base and previous years in SMUs (10^-4)
+
+```{r}
+life_table[age %in% AGES,
+           .(SMU_change = (max(s_a) - min(s_a))*10^4,
+             la_change = (max(l_a) - min(l_a))),
+            by=.(age)]
+```
+
+
+
+
+### 2.2 Valuation
+
+
+Our illustration focuses on 3 age groups: 20, 50, and 80. We select those values in a separate table for further calculations.
+
+```{r}
+vsly_illustration_data <- life_table[age %in% AGES & year == BASE_YEAR]
+```
+
+Define a grid of DLE changes up to 1
+
+```{r}
+L_STEP <- 0.01
+delta_l_grid <- seq(0, 1, L_STEP)
+```
+
+Perform a cartesian product with the grid
+```{r}
+vsly_illustration_data[,VAR:=1] # Auxiliary variable just for the product
+vsly_illustration_data <- merge(vsly_illustration_data, data.table(delta_l=delta_l_grid, VAR=1), by="VAR", allow.cartesian = T)
+vsly_illustration_data[,VAR:=NULL]
+```
+
+Calculate $\tilde{l}$
+
+```{r}
+vsly_illustration_data[, l_a_tilde:=l_a + delta_l]
+```
+
+We need to assume a $tilde{s}$. In this case, we will assume it increases in the same proportion as $l$, so
+
+$$
+\tilde{s}_a = s_a \frac{\tilde{l}_a}{l_a}
+$$
+
+So that $\tilde{l}_a/\tilde{s}_a = l_a / s_a$
+
+```{r}
+vsly_illustration_data[, s_a_tilde:=s_a * l_a_tilde/l_a]
+```
+
+The following function calculates $b_a$ following the formula derived in the paper.
+
+```{r}
+calculate_b_a <- function(l_a, l_a_tilde, s_a_tilde, gamma_hat, s_a_hat, rho) {
+  if (rho == 0) { # Linear case
+    b <- (l_a_tilde - l_a)*gamma_hat
+  }
+  else {
+    if (rho == 1) { # Log utility
+      b <- l_a_tilde/s_a_tilde * (1 - exp(-(l_a_tilde - l_a)/l_a_tilde*gamma_hat*s_a_hat))
+    } else { # CRRA with rho != 1
+      b <- l_a_tilde/s_a_tilde * (1 - ( 1 - (1-rho)*(l_a_tilde - l_a)/l_a_tilde*gamma_hat*s_a_hat)^(1/(1-rho)))
+    }
+  }
+}
+```
+
+Apply functions to calculate $b_a$ for the linear, log, and $\rho=2$ cases.
+
+```{r}
+vsly_illustration_data[, b_linear:=calculate_b_a(l_a, l_a_tilde, s_a_tilde, GAMMA_HAT, s_a, rho = 0)]
+vsly_illustration_data[, b_log:=   calculate_b_a(l_a, l_a_tilde, s_a_tilde, GAMMA_HAT, s_a, rho = 1)]
+vsly_illustration_data[, b_crra:=  calculate_b_a(l_a, l_a_tilde, s_a_tilde, GAMMA_HAT, s_a, rho = 2)]
+```
+
+For plotting, calculate the marginal value
+
+```{r}
+vsly_illustration_data[, mg_b_linear:= (b_linear-shift(b_linear, 1))/L_STEP, by=age]
+vsly_illustration_data[, mg_b_log:= (b_log-shift(b_log, 1))/L_STEP, by=age]
+vsly_illustration_data[, mg_b_crra:= (b_crra-shift(b_crra, 1))/L_STEP, by=age]
+```
+
+Manually set initial marginal values
+
+```{r}
+vsly_illustration_data[delta_l == 0, mg_b_linear:= GAMMA_HAT]
+vsly_illustration_data[delta_l == 0, mg_b_log:= GAMMA_HAT]
+vsly_illustration_data[delta_l == 0, mg_b_crra:= GAMMA_HAT]
+```
+
+Make marginal changes relative to initial for plotting
+
+```{r}
+vsly_illustration_data[, rel_mg_b_linear := mg_b_linear/GAMMA_HAT]
+vsly_illustration_data[, rel_mg_b_log := mg_b_log/GAMMA_HAT]
+vsly_illustration_data[, rel_mg_b_crra := mg_b_crra/GAMMA_HAT]
+```
+
+Also calculate marginal VSL
+```{r}
+vsly_illustration_data[, mg_v_linear := mg_b_linear*l_a/s_a]
+vsly_illustration_data[, mg_v_log := mg_b_log*l_a/s_a]
+vsly_illustration_data[, mg_v_crra := mg_b_crra*l_a/s_a]
+```
+
+
+## 3. Output
+
+
+### 3.1 Tables
+
+```{r}
+results <- vsly_illustration_data[delta_l == 1,
+                                  .(l_a,
+                                    inc = l_a_tilde/l_a - 1, 
+                                    b_linear,
+                                    b_log,
+                                    b_crra,
+                                    initial_VSLY = mg_b_linear,
+                                    mg_vsly_linear = mg_b_linear,
+                                    mg_vsly_log = mg_b_log,
+                                    mg_vsly_crr = mg_b_crra
+                                  ), by=.(age)]
+
+setorder(results, age)
+results
+```
+
+Format table for exporting. 
+
+```{r}
+# Transpose
+results_table <- as.data.frame(transpose(results[,2:10]))
+
+# Add column with variable names
+latex_colnames <- c(
+  "Discounted Life Expectancy (DLE) [$l_a$]",
+  "Proportional DLE increase [$1/l_a$]",
+  "Value, linear [$b^{linear}(l_a, l_a + 1)$]",
+  "Value, CCV $\\rho = 1$ [$b^{log}(l_a, l_a + 1)$]",
+  "Value, CCV $\\rho = 2$ [$b^{crra}(l_a, l_a + 1)$]",
+  "Initial VSLY",
+  "Marginal VSLY, linear",
+  "Marginal VSLY, CCV $\\rho = 1$",
+  "Marginal VSLY, CCV $\\rho = 2$")
+
+results_table <- cbind(latex_colnames, results_table)
+
+# Define header 
+tab_header <- list()
+tab_header$pos <- list()
+tab_header$pos[[1]] <- 0
+tab_header$command <- c(" & \\multicolumn{3}{c}{Age} \\\\ \\cline{2-4}
+                        & 20 & 50 & 80 \\\\ 
+                        ")
+```
+
+
+```{r}
+if(SAVETAB) {
+  print(xtable(results_table),
+        include.rownames = FALSE,
+        include.colnames = FALSE,
+        floating = FALSE,
+        sanitize.text.function = I,
+        add.to.row = tab_header,
+        hline.after = c(-1, 0, 9),
+        digits = 2,
+        file=file.path(OUTPUT_FOLDER, "illustration_table.tex"))
+}
+```
+
+### 3.2 Plots
+
+Format age labels
+
+```{r}
+vsly_illustration_data[, age_label:=paste0("Age ", age)]
+```
+
+Results per age group
+
+```{r}
+ggplot(vsly_illustration_data, aes(x=delta_l)) +
+  geom_line(aes(y=b_linear, linetype="0_linear")) +
+  geom_line(aes(y=b_log, linetype="1_log")) +
+  geom_line(aes(y=b_crra, linetype="2_crra")) +
+  labs(x=TeX("Discounted life expectancy change ($\\textit{\\tilde{l}_a-l_a}$)"),
+       y=TeX("Present value-to-income ratio ($\\textit{b}$)")) +
+  scale_y_continuous(limits=c(0,GAMMA_HAT), breaks=seq(0, 6)) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0, 1, 0.25)) +
+  scale_linetype_manual(name="",
+                 values=c("0_linear"="solid",
+                          "1_log"="dashed",
+                          "2_crra"="dotted"),
+                 labels=c("Constant VSLY", TeX("CCV, $\\rho=1"), TeX("CCV, $\\rho=2"))) +
+  facet_wrap(~age_label, scales="fixed") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text = element_text (size = 7),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        legend.margin = margin(b=0, unit = "cm")
+        )
+
+if(SAVEFIG) ggsave(file.path(OUTPUT_FOLDER, "VSLY_NPV_by_method.pdf"),
+                 width = 5.5, height = 3.2)
+```
+Marginal to initial VSLY ratios
+
+```{r}
+ggplot(vsly_illustration_data, aes(x=delta_l)) +
+  geom_line(aes(y=rel_mg_b_linear, linetype="0_linear")) +
+  geom_line(aes(y=rel_mg_b_log, linetype="1_log")) +
+  geom_line(aes(y=rel_mg_b_crra, linetype="2_crra")) +
+  labs(x=TeX("Discounted life expectancy change ($\\textit{\\tilde{l}_a-l_a}$)"),
+       y=TeX("Marginal-to-initial VSLY ratio")) +
+  scale_y_continuous(limits=c(0,1.01), breaks=seq(0, 1.0, 0.25)) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0, 1, 0.25)) +
+  scale_linetype_manual(name="",
+                 values=c("0_linear"="solid",
+                          "1_log"="dashed",
+                          "2_crra"="dotted"),
+                 labels=c("Constant VSLY", TeX("CCV, $\\rho=1"), TeX("CCV, $\\rho=2"))) +
+  facet_wrap(~age_label, scales="fixed") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text = element_text (size = 7),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        legend.margin = margin(b=0, unit = "cm")
+        )
+
+if(SAVEFIG) ggsave(file.path(OUTPUT_FOLDER, "Mg_VSLY_NPV_by_method.pdf"),
+                 width = 5.5, height = 3.2)
+```
+
+
+Marginal to initial VSLY ratios
+
+```{r}
+ggplot(vsly_illustration_data, aes(x=delta_l)) +
+  geom_line(aes(y=mg_v_linear, linetype="0_linear")) +
+  geom_line(aes(y=mg_v_log, linetype="1_log")) +
+  geom_line(aes(y=mg_v_crra, linetype="2_crra")) +
+  labs(x=TeX("Discounted life expectancy change ($\\textit{\\tilde{l}_a-l_a}$)"),
+       y=TeX("Marginal VSL-to-income ratio")) +
+  scale_y_continuous(limits=c(0,211), breaks=seq(0, 200, 50)) +
+  scale_x_continuous(limits=c(0,1), breaks=seq(0, 1, 0.25)) +
+  scale_linetype_manual(name="",
+                 values=c("0_linear"="solid",
+                          "1_log"="dashed",
+                          "2_crra"="dotted"),
+                 labels=c("Constant VSLY", TeX("CCV, $\\rho=1"), TeX("CCV, $\\rho=2"))) +
+  facet_wrap(~age_label, scales="fixed") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text = element_text (size = 7),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8),
+        legend.margin = margin(b=0, unit = "cm")
+        )
+
+if(SAVEFIG) ggsave(file.path(OUTPUT_FOLDER, "Mg_VSL_NPV_by_method.pdf"),
+                 width = 5.5, height = 3.2)
+```
