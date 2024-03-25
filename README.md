@@ -7,6 +7,6 @@ Suggested citation:
 
 This package does not include the mortality data maintained by the United Nations. These data is publicly available from [United Nations World Population Prospects 2022 website](https://population.un.org/wpp/Download/Standard/CSV/).
 
-The code is embedded in a Quarto document. The latest version of this document can be viewed on the browser following this link:
+The code is embedded in a Quarto document. The latest version of this document can be viewed on the browser following [this link](https://rawcdn.githack.com/dscardoso/cardoso_and_dahis_2024/3f4923de1d4f93a97df412d9202ed255c561c75d/replication_code.html).
 
 
